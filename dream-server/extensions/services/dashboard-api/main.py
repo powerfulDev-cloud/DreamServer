@@ -41,7 +41,7 @@ from helpers import (
     get_uptime, get_cpu_metrics, get_ram_metrics,
     get_llama_metrics, get_loaded_model, get_llama_context_size,
 )
-from agent_monitor import collect_metrics
+from agent_monitor import collect_metrics, throughput
 
 
 # ================================================================
@@ -390,6 +390,93 @@ async def _build_api_status() -> dict:
         "manifest_errors": MANIFEST_ERRORS,
     }
     return result
+
+
+def _serialize_metrics_gpu(gpu_info: Optional[GPUInfo]) -> dict:
+    """Convert a single GPUInfo record into the dashboard chart contract."""
+    if not gpu_info:
+        return {"backend": os.environ.get("GPU_BACKEND", "unknown"), "gpus": []}
+
+    return {
+        "backend": gpu_info.gpu_backend,
+        "memory_type": gpu_info.memory_type,
+        "gpus": [{
+            "index": 0,
+            "name": gpu_info.name,
+            "utilization_percent": gpu_info.utilization_percent,
+            "memory_used_mb": gpu_info.memory_used_mb,
+            "memory_total_mb": gpu_info.memory_total_mb,
+            "memory_percent": gpu_info.memory_percent,
+            "temperature_c": gpu_info.temperature_c,
+            "power_w": gpu_info.power_w,
+        }],
+    }
+
+
+def _build_metrics_fallback() -> dict:
+    """Return a stable zeroed payload for chart polling failures."""
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "gpu": {
+            "backend": os.environ.get("GPU_BACKEND", "unknown"),
+            "gpus": [],
+        },
+        "llama": {
+            "tokens_per_second_current": 0,
+            "tokens_per_second_average": 0,
+            "tokens_per_second_peak": 0,
+            "lifetime_tokens": 0,
+            "loaded_model": None,
+            "context_size": None,
+        },
+    }
+
+
+async def _build_metrics_payload() -> dict:
+    """Build the compact polling payload used by the legacy dashboard charts."""
+    gpu_info, model_info, loaded_model = await asyncio.gather(
+        asyncio.to_thread(get_gpu_info),
+        asyncio.to_thread(get_model_info),
+        get_loaded_model(),
+    )
+
+    llama_metrics_data, context_size = await asyncio.gather(
+        get_llama_metrics(model_hint=loaded_model),
+        get_llama_context_size(model_hint=loaded_model),
+    )
+
+    throughput_stats = throughput.get_stats()
+    current_tps = llama_metrics_data.get("tokens_per_second", 0)
+    average_tps = throughput_stats.get("average", 0)
+    peak_tps = throughput_stats.get("peak", 0)
+
+    # Prefer the llama-server live counter for the current sample, but fold in
+    # the throughput history when it has seen activity and the scrape has not.
+    if current_tps <= 0 and throughput_stats.get("current", 0) > 0:
+        current_tps = throughput_stats["current"]
+
+    return {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "gpu": _serialize_metrics_gpu(gpu_info),
+        "llama": {
+            "tokens_per_second_current": round(current_tps, 2),
+            "tokens_per_second_average": round(average_tps, 2),
+            "tokens_per_second_peak": round(max(peak_tps, current_tps), 2),
+            "lifetime_tokens": int(llama_metrics_data.get("lifetime_tokens", 0)),
+            "loaded_model": loaded_model or (model_info.name if model_info else None),
+            "context_size": context_size or (model_info.context_length if model_info else None),
+        },
+    }
+
+
+@app.get("/api/metrics")
+async def api_metrics(api_key: str = Depends(verify_api_key)):
+    """Compact metrics endpoint for chart polling in the legacy dashboard."""
+    try:
+        return await _build_metrics_payload()
+    except Exception:
+        logger.exception("/api/metrics handler failed — returning safe fallback")
+        return _build_metrics_fallback()
 
 
 # --- Settings ---

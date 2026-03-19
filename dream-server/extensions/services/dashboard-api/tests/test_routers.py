@@ -295,6 +295,36 @@ def test_api_status_authenticated(test_client):
     assert "inference" in data
 
 
+def test_api_metrics_authenticated(test_client):
+    """GET /api/metrics with auth → 200, returns chart polling payload."""
+    resp = test_client.get("/api/metrics", headers=test_client.auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "timestamp" in data
+    assert "gpu" in data
+    assert "llama" in data
+    assert "gpus" in data["gpu"]
+    assert "tokens_per_second_current" in data["llama"]
+    assert "tokens_per_second_average" in data["llama"]
+    assert "tokens_per_second_peak" in data["llama"]
+
+
+def test_api_metrics_safe_fallback_on_failure(test_client, monkeypatch):
+    """GET /api/metrics degrades gracefully when payload construction fails."""
+    monkeypatch.setattr(
+        "main._build_metrics_payload",
+        AsyncMock(side_effect=RuntimeError("metrics blew up")),
+    )
+
+    resp = test_client.get("/api/metrics", headers=test_client.auth_headers)
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["gpu"]["gpus"] == []
+    assert data["llama"]["tokens_per_second_current"] == 0
+    assert data["llama"]["loaded_model"] is None
+
+
 def test_api_storage_authenticated(test_client):
     """GET /api/storage with auth → 200, returns storage breakdown."""
     resp = test_client.get("/api/storage", headers=test_client.auth_headers)
@@ -459,4 +489,3 @@ def test_agents_throughput_authenticated(test_client):
     assert data["peak"] == 55.0  # Max of all samples
     assert data["average"] == (42.0 + 55.0 + 38.0) / 3  # Average of all samples
     assert len(data["history"]) == 3
-

@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from main import get_allowed_origins, _build_api_status
+from main import (
+    get_allowed_origins,
+    _build_api_status,
+    _build_metrics_payload,
+    _build_metrics_fallback,
+    _serialize_metrics_gpu,
+)
 
 
 # --- get_allowed_origins ---
@@ -256,6 +262,153 @@ class TestBuildApiStatus:
 
         result = await _build_api_status()
         assert result["tier"] == "Strix Halo 90+"
+
+
+# --- /api/metrics helpers ---
+
+
+class TestMetricsHelpers:
+
+    def test_serialize_metrics_gpu_with_gpu(self):
+        from models import GPUInfo
+
+        gpu = GPUInfo(
+            name="RTX 4090",
+            memory_used_mb=2048,
+            memory_total_mb=24576,
+            memory_percent=8.3,
+            utilization_percent=35,
+            temperature_c=62,
+            power_w=250.0,
+            gpu_backend="nvidia",
+        )
+
+        result = _serialize_metrics_gpu(gpu)
+
+        assert result["backend"] == "nvidia"
+        assert result["memory_type"] == "discrete"
+        assert len(result["gpus"]) == 1
+        assert result["gpus"][0]["index"] == 0
+        assert result["gpus"][0]["utilization_percent"] == 35
+        assert result["gpus"][0]["power_w"] == 250.0
+
+    def test_serialize_metrics_gpu_without_gpu(self, monkeypatch):
+        monkeypatch.setenv("GPU_BACKEND", "amd")
+
+        result = _serialize_metrics_gpu(None)
+
+        assert result == {"backend": "amd", "gpus": []}
+
+    def test_serialize_metrics_gpu_preserves_unified_memory_shape(self):
+        from models import GPUInfo
+
+        gpu = GPUInfo(
+            name="Strix Halo",
+            memory_used_mb=10240,
+            memory_total_mb=98304,
+            memory_percent=10.4,
+            utilization_percent=15,
+            temperature_c=55,
+            memory_type="unified",
+            gpu_backend="amd",
+        )
+
+        result = _serialize_metrics_gpu(gpu)
+
+        assert result["backend"] == "amd"
+        assert result["memory_type"] == "unified"
+        assert result["gpus"][0]["memory_total_mb"] == 98304
+        assert result["gpus"][0]["utilization_percent"] == 15
+
+    def test_metrics_fallback_shape(self, monkeypatch):
+        monkeypatch.setenv("GPU_BACKEND", "nvidia")
+
+        result = _build_metrics_fallback()
+
+        assert "timestamp" in result
+        assert result["gpu"] == {"backend": "nvidia", "gpus": []}
+        assert result["llama"]["tokens_per_second_current"] == 0
+        assert result["llama"]["loaded_model"] is None
+
+    @pytest.mark.asyncio
+    async def test_build_metrics_payload_happy_path(self, monkeypatch):
+        from models import GPUInfo, ModelInfo
+
+        gpu = GPUInfo(
+            name="RTX 4090",
+            memory_used_mb=2048,
+            memory_total_mb=24576,
+            memory_percent=8.3,
+            utilization_percent=35,
+            temperature_c=62,
+            power_w=250.0,
+            gpu_backend="nvidia",
+        )
+        monkeypatch.setattr("main.get_gpu_info", lambda: gpu)
+        monkeypatch.setattr(
+            "main.get_model_info",
+            lambda: ModelInfo(name="Test-32B", size_gb=16.0, context_length=32768),
+        )
+        monkeypatch.setattr("main.get_loaded_model", AsyncMock(return_value="Test-32B"))
+        monkeypatch.setattr(
+            "main.get_llama_metrics",
+            AsyncMock(return_value={"tokens_per_second": 25.5, "lifetime_tokens": 10000}),
+        )
+        monkeypatch.setattr("main.get_llama_context_size", AsyncMock(return_value=32768))
+
+        mock_throughput = MagicMock()
+        mock_throughput.get_stats.return_value = {
+            "current": 24.9,
+            "average": 20.1,
+            "peak": 31.2,
+            "history": [],
+        }
+        monkeypatch.setattr("main.throughput", mock_throughput)
+
+        result = await _build_metrics_payload()
+
+        assert result["gpu"]["backend"] == "nvidia"
+        assert result["gpu"]["gpus"][0]["name"] == "RTX 4090"
+        assert result["llama"]["tokens_per_second_current"] == 25.5
+        assert result["llama"]["tokens_per_second_average"] == 20.1
+        assert result["llama"]["tokens_per_second_peak"] == 31.2
+        assert result["llama"]["lifetime_tokens"] == 10000
+        assert result["llama"]["loaded_model"] == "Test-32B"
+        assert result["llama"]["context_size"] == 32768
+
+    @pytest.mark.asyncio
+    async def test_build_metrics_payload_uses_fallback_sources(self, monkeypatch):
+        from models import ModelInfo
+
+        monkeypatch.setattr("main.get_gpu_info", lambda: None)
+        monkeypatch.setattr(
+            "main.get_model_info",
+            lambda: ModelInfo(name="Fallback-Model", size_gb=4.0, context_length=8192),
+        )
+        monkeypatch.setattr("main.get_loaded_model", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            "main.get_llama_metrics",
+            AsyncMock(return_value={"tokens_per_second": 0, "lifetime_tokens": 42}),
+        )
+        monkeypatch.setattr("main.get_llama_context_size", AsyncMock(return_value=None))
+
+        mock_throughput = MagicMock()
+        mock_throughput.get_stats.return_value = {
+            "current": 12.3,
+            "average": 10.0,
+            "peak": 15.7,
+            "history": [],
+        }
+        monkeypatch.setattr("main.throughput", mock_throughput)
+
+        result = await _build_metrics_payload()
+
+        assert result["gpu"]["gpus"] == []
+        assert result["llama"]["tokens_per_second_current"] == 12.3
+        assert result["llama"]["tokens_per_second_average"] == 10.0
+        assert result["llama"]["tokens_per_second_peak"] == 15.7
+        assert result["llama"]["loaded_model"] == "Fallback-Model"
+        assert result["llama"]["context_size"] == 8192
 
 
 # --- /api/service-tokens ---

@@ -51,6 +51,7 @@ Environment variables (set in `.env`):
 | `GET` | `/bootstrap` | Yes | Model bootstrap/download status |
 | `GET` | `/status` | Yes | Full system status (all above combined) |
 | `GET` | `/api/status` | Yes | Dashboard-formatted status with inference metrics |
+| `GET` | `/api/metrics` | Yes | Compact chart payload for dashboard polling |
 
 ### Preflight
 
@@ -106,6 +107,50 @@ Environment variables (set in `.env`):
 | `GET` | `/api/agents/metrics.html` | Yes | Agent metrics as HTML fragment (htmx) |
 | `GET` | `/api/agents/cluster` | Yes | Cluster health and GPU node status |
 | `GET` | `/api/agents/throughput` | Yes | Throughput stats (tokens/sec) |
+
+## Metrics Payload
+
+The legacy dashboard template polls `GET /api/metrics` every 5 seconds for
+chart-friendly data. The endpoint is intentionally compact and resilient:
+
+- `gpu.gpus` is always an array, even on single-GPU or CPU-only systems
+- single-device hosts are normalized to `gpus[0]` so chart code can stay simple
+- `llama.tokens_per_second_current` prefers live llama-server metrics
+- `llama.tokens_per_second_average` and `peak` come from the rolling throughput history
+- `loaded_model` and `context_size` fall back to local model metadata when live probes are unavailable
+- failures degrade to a zeroed payload instead of surfacing a raw `500`
+
+Example response:
+
+```json
+{
+  "timestamp": "2026-03-19T12:00:00+00:00",
+  "gpu": {
+    "backend": "nvidia",
+    "memory_type": "discrete",
+    "gpus": [
+      {
+        "index": 0,
+        "name": "RTX 4090",
+        "utilization_percent": 35,
+        "memory_used_mb": 2048,
+        "memory_total_mb": 24576,
+        "memory_percent": 8.3,
+        "temperature_c": 62,
+        "power_w": 250.0
+      }
+    ]
+  },
+  "llama": {
+    "tokens_per_second_current": 25.5,
+    "tokens_per_second_average": 20.1,
+    "tokens_per_second_peak": 31.2,
+    "lifetime_tokens": 10000,
+    "loaded_model": "qwen3:30b-a3b",
+    "context_size": 32768
+  }
+}
+```
 
 ### Privacy Shield
 
